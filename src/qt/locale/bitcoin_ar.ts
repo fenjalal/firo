@@ -796,6 +796,14 @@
         <translation>نمودج</translation>
     </message>
     <message>
+        <source>Wallet is still syncing</source>
+        <translation>المحفظة لا تزال قيد المزامنة</translation>
+    </message>
+    <message>
+        <source>Wallet is synchronized</source>
+        <translation>تمت مزامنة المحفظة</translation>
+    </message>
+    <message>
         <source>Hide</source>
         <translation>إخفاء</translation>
     </message>
@@ -1265,6 +1273,14 @@
     <message>
         <source>Send Coins</source>
         <translation>إرسال Coins</translation>
+    </message>
+    <message>
+        <source>Transaction Fee</source>
+        <translation>رسوم المعاملة</translation>
+    </message>
+    <message>
+        <source>Warning: Fee estimation is currently not possible.</source>
+        <translation>تحذير: تقدير الرسوم غير ممكن حاليًا.</translation>
     </message>
     <message>
         <source>automatically selected</source>
