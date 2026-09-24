@@ -4311,6 +4311,10 @@ Raw data: %1</source>
         <source>Error</source>
         <translation>خطأ</translation>
     </message>
+    <message>
+        <source>This is a pre-release test build - use at your own risk - do not use for mining or merchant applications</source>
+        <translation>هذا إصدار تجريبي ما قبل الإطلاق استخدمه على مسؤوليتك الخاصة لا تستخدمه للتعدين أو لتطبيقات التجار.</translation>
+    </message>
 </context>
 <context>
     <name>MasternodeList</name>
