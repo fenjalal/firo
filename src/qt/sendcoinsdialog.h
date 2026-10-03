@@ -24,6 +24,7 @@ namespace Ui {
 
 QT_BEGIN_NAMESPACE
 class QUrl;
+class QPushButton;
 QT_END_NAMESPACE
 
 /** Dialog for sending bitcoins */
@@ -37,6 +38,7 @@ public:
 
     void setClientModel(ClientModel *clientModel);
     void setModel(WalletModel *model);
+    void showOutOfSyncWarning(bool fShow);
 
     /** Set up the tab chain manually, as Qt messes up the tab chain by default in some cases (issue https://bugreports.qt-project.org/browse/QTBUG-10907).
      */
@@ -61,14 +63,13 @@ public Q_SLOTS:
 
 private:
     Ui::SendCoinsDialog *ui;
+    QPushButton *balanceWarning;
     ClientModel *clientModel;
     WalletModel *model;
     bool fNewRecipientAllowed;
     bool fFeeMinimized;
     bool fAnonymousMode;
     const PlatformStyle *platformStyle;
-    void resizeEvent(QResizeEvent* event) override;
-    void adjustTextSize(int width, int height);
     void applyTheme();
 
     // Process WalletModel::SendCoinsReturn and generate a pair consisting
@@ -109,6 +110,7 @@ private Q_SLOTS:
 Q_SIGNALS:
     // Fired when a message should be reported to the user
     void message(const QString &title, const QString &message, unsigned int style);
+    void outOfSyncWarningClicked();
 };
 
 

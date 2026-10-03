@@ -110,14 +110,28 @@ CSparkWallet::CSparkWallet(const std::string& strWalletFile) {
 }
 
 CSparkWallet::~CSparkWallet() {
+    LOCK(cs_thread_pool);
     delete (ParallelOpThreadPool<void>*)threadPool;
     threadPool = nullptr;
 }
 
 void CSparkWallet::FinishTasks() {
+    LOCK(cs_thread_pool);
     if (threadPool) {
         ((ParallelOpThreadPool<void>*)threadPool)->Shutdown();
     }
+}
+
+void CSparkWallet::WaitForPendingTasks() {
+    LOCK(cs_thread_pool);
+    if (!threadPool)
+        return;
+
+    auto* pool = (ParallelOpThreadPool<void>*)threadPool;
+    if (pool->IsPoolShutdown())
+        return;
+
+    pool->PostTask([]() {}).wait();
 }
 
 void CSparkWallet::resetDiversifierFromDB(CWalletDB& walletdb) {
@@ -332,10 +346,6 @@ bool CSparkWallet::isAddressMine(const std::string& encodedAddr) {
 
 bool CSparkWallet::isAddressMine(const spark::Address& address) {
     LOCK(cs_spark_wallet);
-    for (const auto& itr : addresses) {
-        if (itr.second.get_Q1() == address.get_Q1() && itr.second.get_Q2() == address.get_Q2())
-            return true;
-    }
 
     uint64_t d;
 
@@ -345,7 +355,9 @@ bool CSparkWallet::isAddressMine(const spark::Address& address) {
         return false;
     }
 
-    spark::Address newAddr = getAddress(int32_t(d));
+    spark::Address newAddr = d <= static_cast<uint64_t>(std::numeric_limits<int32_t>::max())
+        ? getAddress(static_cast<int32_t>(d))
+        : spark::Address(viewKey, d);
     if (newAddr.get_Q1() == address.get_Q1() && newAddr.get_Q2() == address.get_Q2())
         return true;
 

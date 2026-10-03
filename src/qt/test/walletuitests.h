@@ -14,14 +14,24 @@ class WalletUiTests : public QObject
 private Q_SLOTS:
     void initialSyncQueryDoesNotBlock();
     void synchronizationProgress();
+    void synchronizationEstimates();
+    void synchronizationWarnings();
     void collapsedNavigationRemainsUsable();
     void paymentRequestFitsSmallScreen();
     void receiveFormFitsSmallScreen();
     void sendFormFitsSmallScreen();
     void receiveMnemonics();
+    void emptyRecoverySeed();
     void confirmationRefresh();
     void themeTintColors();
+    void peerDetailsTheme();
+    void transactionCalendarTheme();
+    void brandTypography();
+    void recentActivityFitsBrandFont();
     void deferredTransactionsKeepOrder();
+    void paymentCodeIndexesWithoutAddressCache();
+    void splashMessageDoesNotProcessEvents();
+    void splashShutdownControls();
     void failedAbandonKeepsTransactionVisible();
     void themeChangePreservesWidgetState();
     void sparkNamesRefreshAfterModelDestruction();

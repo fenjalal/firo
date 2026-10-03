@@ -484,6 +484,7 @@ void RPCConsole::applyConsoleTheme()
 {
     setStyleSheet(GUIUtil::themed(QStringLiteral(R"(
         QWidget#RPCConsole { background: $BG; }
+        QWidget#tab_peers, QWidget#detailWidget { background: $BG; }
         QTabWidget::pane { background: $PANEL; border: 1px solid $BORDER; border-radius: 14px; top: -1px; }
         QTabBar::tab {
             background: transparent;
@@ -964,7 +965,7 @@ void RPCConsole::on_lineEdit_returnPressed()
                 throw std::runtime_error("Invalid command line");
             }
         } catch (const std::exception& e) {
-            QMessageBox::critical(this, "Error", QString("Error: ") + QString::fromStdString(e.what()));
+            QMessageBox::critical(this, tr("Error"), tr("Error: %1").arg(QString::fromStdString(e.what())));
             return;
         }
 

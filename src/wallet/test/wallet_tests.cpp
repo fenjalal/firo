@@ -4,6 +4,12 @@
 
 #include "wallet/wallet.h"
 
+#include "evo/deterministicmns.h"
+#include "evo/evodb.h"
+#include "evo/providertx.h"
+#include "evo/specialtx.h"
+#include "script/standard.h"
+
 #include <set>
 #include <stdint.h>
 #include <utility>
@@ -395,14 +401,109 @@ BOOST_AUTO_TEST_CASE(ApproximateBestSubset)
     empty_wallet();
 }*/
 
+BOOST_AUTO_TEST_CASE(auto_lock_masternode_collaterals)
+{
+    CWallet testWallet;
+    LOCK2(cs_main, testWallet.cs_wallet);
+
+    CKey ownedKey, watchedKey, foreignKey;
+    ownedKey.MakeNewKey(true);
+    watchedKey.MakeNewKey(true);
+    foreignKey.MakeNewKey(true);
+    BOOST_REQUIRE(testWallet.AddKeyPubKey(ownedKey, ownedKey.GetPubKey()));
+    const CScript ownedScript = GetScriptForDestination(ownedKey.GetPubKey().GetID());
+    const CScript watchedScript = GetScriptForDestination(watchedKey.GetPubKey().GetID());
+    const CScript foreignScript = GetScriptForDestination(foreignKey.GetPubKey().GetID());
+    BOOST_REQUIRE(testWallet.AddWatchOnly(watchedScript, 0));
+
+    uint32_t nonce = 0;
+    const auto addOutput = [&](const CScript& script, CAmount amount, bool internal) {
+        CMutableTransaction tx;
+        tx.nLockTime = ++nonce;
+        // The other output has the collateral amount too, but is not collateral.
+        tx.vout.emplace_back(1000 * COIN, ownedScript);
+        tx.vout.emplace_back(amount, script);
+        if (internal) {
+            tx.nVersion = 3;
+            tx.nType = TRANSACTION_PROVIDER_REGISTER;
+            CProRegTx proTx;
+            proTx.collateralOutpoint.n = 1;
+            SetTxPayload(tx, proTx);
+        }
+        const auto txRef = MakeTransactionRef(tx);
+        // Exercise the startup scan, not AddToWallet's independent auto-locking.
+        BOOST_REQUIRE(testWallet.LoadToWallet(CWalletTx(&testWallet, txRef)));
+        return COutPoint(txRef->GetHash(), 1);
+    };
+
+    const auto internalOwned = addOutput(ownedScript, 1000 * COIN, true);
+    const auto internalWatched = addOutput(watchedScript, 1000 * COIN, true);
+    const auto internalForeign = addOutput(foreignScript, 1000 * COIN, true);
+    const auto internalSpent = addOutput(ownedScript, 1000 * COIN, true);
+    const auto wrongAmount = addOutput(ownedScript, 999 * COIN, true);
+    const auto ordinary = addOutput(ownedScript, 1000 * COIN, false);
+    const auto externalOwned = addOutput(ownedScript, 1000 * COIN, false);
+    const auto externalForeign = addOutput(foreignScript, 1000 * COIN, false);
+    const auto externalSpent = addOutput(ownedScript, 1000 * COIN, false);
+
+    // Supply an MN-list snapshot in the fixture's in-memory EvoDB. These
+    // ordinary transactions are collateral only through their registered MNs.
+    const CBlockIndex* tip = chainActive.Tip();
+    BOOST_REQUIRE(tip);
+    CDeterministicMNList mnList(tip->GetBlockHash(), tip->nHeight, 3);
+    for (const auto& collateral : {externalOwned, externalForeign, externalSpent}) {
+        auto dmn = std::make_shared<CDeterministicMN>();
+        dmn->proTxHash = SerializeHash(collateral);
+        dmn->internalId = mnList.GetAllMNsCount();
+        dmn->collateralOutpoint = collateral;
+        dmn->nOperatorReward = 0;
+        auto dmnState = std::make_shared<CDeterministicMNState>();
+        CKey ownerKey;
+        ownerKey.MakeNewKey(true);
+        dmnState->keyIDOwner = ownerKey.GetPubKey().GetID();
+        dmn->pdmnState = dmnState;
+        mnList.AddMN(dmn);
+    }
+    evoDb->Write(std::make_pair(std::string("dmn_S"), tip->GetBlockHash()), mnList);
+    deterministicMNManager->ClearCache();
+    deterministicMNManager->UpdatedBlockTip(tip);
+    BOOST_REQUIRE(deterministicMNManager->GetListAtChainTip().HasMNByCollateral(externalOwned));
+
+    CMutableTransaction spend;
+    spend.vin.emplace_back(internalSpent);
+    spend.vin.emplace_back(externalSpent);
+    spend.vout.emplace_back(1 * COIN, ownedScript);
+    BOOST_REQUIRE(testWallet.LoadToWallet(CWalletTx(&testWallet, MakeTransactionRef(spend))));
+    BOOST_REQUIRE(testWallet.IsSpent(internalSpent.hash, internalSpent.n));
+    BOOST_REQUIRE(testWallet.IsSpent(externalSpent.hash, externalSpent.n));
+
+    testWallet.LockCoin(ordinary); // Preserve existing manual locks as well.
+    testWallet.AutoLockMasternodeCollaterals();
+    std::vector<COutPoint> locked;
+    testWallet.ListLockedCoins(locked);
+    const std::set<COutPoint> expected{internalOwned, internalWatched, externalOwned, ordinary};
+    BOOST_CHECK(std::set<COutPoint>(locked.begin(), locked.end()) == expected);
+    BOOST_CHECK(!testWallet.IsLockedCoin(internalForeign.hash, internalForeign.n));
+    BOOST_CHECK(!testWallet.IsLockedCoin(externalForeign.hash, externalForeign.n));
+    BOOST_CHECK(!testWallet.IsLockedCoin(wrongAmount.hash, wrongAmount.n));
+
+    testWallet.AutoLockMasternodeCollaterals();
+    locked.clear();
+    testWallet.ListLockedCoins(locked);
+    BOOST_CHECK(std::set<COutPoint>(locked.begin(), locked.end()) == expected);
+}
+
 BOOST_FIXTURE_TEST_CASE(rescan, TestChain100Setup)
 {
-    LOCK(cs_main);
-
     // Cap last block file size, and mine new block in a new block file.
-    CBlockIndex* oldTip = chainActive.Tip();
-    GetBlockFileInfo(oldTip->GetBlockPos().nFile)->nSize = MAX_BLOCKFILE_SIZE;
+    CBlockIndex* oldTip;
+    {
+        LOCK(cs_main);
+        oldTip = chainActive.Tip();
+        GetBlockFileInfo(oldTip->GetBlockPos().nFile)->nSize = MAX_BLOCKFILE_SIZE;
+    }
     CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    LOCK(cs_main);
     CBlockIndex* newTip = chainActive.Tip();
 
     // Verify ScanForWalletTransactions picks up transactions in both the old
@@ -469,7 +570,6 @@ BOOST_FIXTURE_TEST_CASE(rescan, TestChain100Setup)
 BOOST_FIXTURE_TEST_CASE(importwallet_rescan, TestChain100Setup)
 {
     CWallet *pwalletMainBackup = ::pwalletMain;
-    LOCK(cs_main);
 
     // Create two blocks with same timestamp to verify that importwallet rescan
     // will pick up both blocks, not just the first.
@@ -484,6 +584,7 @@ BOOST_FIXTURE_TEST_CASE(importwallet_rescan, TestChain100Setup)
     SetMockTime(KEY_TIME);
     coinbaseTxns.emplace_back(*CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey())).vtx[0]);
 
+    LOCK(cs_main);
     // Import key into wallet and call dumpwallet to create backup file.
     {
         CWallet wallet;

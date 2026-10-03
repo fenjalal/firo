@@ -6,20 +6,27 @@
 
 #include "addresstablemodel.h"
 #include "bitcoingui.h"
+#include "bip47/defs.h"
 #include "chainparams.h"
 #include "clientmodel.h"
 #include "createsparknamepage.h"
 #include "guitheme.h"
 #include "guiutil.h"
+#include "init.h"
 #include "masternode-sync.h"
 #include "modaloverlay.h"
 #include "networkstyle.h"
 #include "optionsmodel.h"
+#include "overviewpage.h"
 #include "platformstyle.h"
 #include "receivecoinsdialog.h"
 #include "receiverequestdialog.h"
+#include "recover.h"
+#include "rpcconsole.h"
 #include "sendcoinsdialog.h"
+#include "sparkname.h"
 #include "sparknamespage.h"
+#include "splashscreen.h"
 #include "transactionfilterproxy.h"
 #include "transactionrecord.h"
 #include "transactiontablemodel.h"
@@ -30,27 +37,39 @@
 #include "validation.h"
 #include "wallet/wallet.h"
 #include "walletmodel.h"
+#include "walletview.h"
 
+#include <QAbstractItemDelegate>
 #include <QAbstractSpinBox>
 #include <QAction>
+#include <QApplication>
+#include <QCalendarWidget>
 #include <QColor>
 #include <QComboBox>
+#include <QDateTimeEdit>
 #include <QElapsedTimer>
 #include <QFrame>
+#include <QImage>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListView>
 #include <QLocale>
+#include <QPainter>
 #include <QPointer>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QRadioButton>
 #include <QScopeGuard>
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSettings>
 #include <QSignalSpy>
 #include <QSpinBox>
+#include <QStandardItemModel>
+#include <QStyleOptionViewItem>
 #include <QTableView>
 #include <QTest>
+#include <QTemporaryDir>
 #include <QTextEdit>
 #include <QTimer>
 #include <QToolBar>
@@ -59,6 +78,7 @@
 #include <QVariant>
 
 #include <memory>
+#include <atomic>
 #include <chrono>
 #include <future>
 #include <thread>
@@ -163,6 +183,275 @@ void WalletUiTests::themeTintColors()
             swatch.setStyleSheet(QStringLiteral("background-color: %1;").arg(tint));
             swatch.ensurePolished();
             QCOMPARE(swatch.palette().color(QPalette::Window), color);
+        }
+    }
+}
+
+void WalletUiTests::paymentCodeIndexesWithoutAddressCache()
+{
+    CWallet wallet;
+    wallet.mapCustomKeyValues.emplace(bip47::PcodeLabel() + "test-payment-code", "Test label");
+    const auto addedSlots = uiInterface.NotifySparkNameAdded.num_slots();
+    const auto removedSlots = uiInterface.NotifySparkNameRemoved.num_slots();
+    PcodeAddressTableModel model(&wallet);
+    QCOMPARE(uiInterface.NotifySparkNameAdded.num_slots(), addedSlots);
+    QCOMPARE(uiInterface.NotifySparkNameRemoved.num_slots(), removedSlots);
+    QCOMPARE(model.columnCount(QModelIndex()), 2);
+    const auto index = model.index(0, 1);
+    QVERIFY(index.isValid());
+    QCOMPARE(model.data(index, Qt::DisplayRole).toString(), QString("test-payment-code"));
+    QVERIFY(!model.index(0, 2).isValid());
+    QVERIFY(!model.index(1, 0).isValid());
+    QVERIFY(!model.index(0, 0, index).isValid());
+
+    auto addressBook = std::make_unique<AddressTableModel>(&wallet);
+    {
+        PcodeAddressTableModel temporaryModel(&wallet);
+    }
+    QCOMPARE(uiInterface.NotifySparkNameAdded.num_slots(), addedSlots + 1);
+    QCOMPARE(uiInterface.NotifySparkNameRemoved.num_slots(), removedSlots + 1);
+    const int addressRows = addressBook->rowCount(QModelIndex());
+    const CSparkNameBlockIndexData name("test-name", "test-spark-address", 100, "");
+    uiInterface.NotifySparkNameAdded(name);
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
+    QCOMPARE(addressBook->rowCount(QModelIndex()), addressRows + 1);
+    QCOMPARE(model.rowCount(QModelIndex()), 1);
+    uiInterface.NotifySparkNameRemoved(name);
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
+    QCOMPARE(addressBook->rowCount(QModelIndex()), addressRows);
+    QCOMPARE(model.rowCount(QModelIndex()), 1);
+    addressBook.reset();
+    QCOMPARE(uiInterface.NotifySparkNameAdded.num_slots(), addedSlots);
+    QCOMPARE(uiInterface.NotifySparkNameRemoved.num_slots(), removedSlots);
+}
+
+void WalletUiTests::splashMessageDoesNotProcessEvents()
+{
+    class TestSplashScreen : public SplashScreen
+    {
+    public:
+        using SplashScreen::SplashScreen;
+        int paints = 0;
+        void paintEvent(QPaintEvent* event) override
+        {
+            ++paints;
+            SplashScreen::paintEvent(event);
+        }
+    };
+    const auto loadWalletSlots = uiInterface.LoadWallet.num_slots();
+    const std::unique_ptr<const NetworkStyle> networkStyle(NetworkStyle::instantiate("regtest"));
+    auto* splash = new TestSplashScreen(networkStyle.get());
+    const auto cleanup = qScopeGuard([splash, loadWalletSlots] {
+        splash->slotFinish(nullptr);
+        QCoreApplication::sendPostedEvents(splash, QEvent::DeferredDelete);
+        QCOMPARE(uiInterface.LoadWallet.num_slots(), loadWalletSlots);
+    });
+    splash->setAttribute(Qt::WA_DontShowOnScreen);
+    splash->show();
+    QCoreApplication::processEvents();
+    const int paintsBeforeMessage = splash->paints;
+    bool callbackRan = false;
+    QObject receiver;
+    QMetaObject::invokeMethod(&receiver, [&callbackRan] { callbackRan = true; }, Qt::QueuedConnection);
+
+    uiInterface.InitMessage("Loading wallet...");
+    QVERIFY(splash->paints > paintsBeforeMessage);
+    QCOMPARE(splash->accessibleDescription(), QStringLiteral("Loading wallet..."));
+    QVERIFY(!callbackRan);
+    QCoreApplication::processEvents();
+    QVERIFY(callbackRan);
+
+    const int paintsBeforeProgress = splash->paints;
+    std::thread core([] {
+        uiInterface.ShowProgress("Verifying blocks...", 1);
+        uiInterface.ShowProgress("Verifying blocks...", 2);
+        uiInterface.InitMessage("Loading wallet...");
+    });
+    core.join();
+    QCoreApplication::sendPostedEvents(splash, QEvent::MetaCall);
+    QCOMPARE(splash->paints, paintsBeforeProgress);
+    QCOMPARE(splash->accessibleDescription(), QStringLiteral("Loading wallet..."));
+    QCoreApplication::processEvents();
+    QVERIFY(splash->paints > paintsBeforeProgress);
+
+    auto* timer = splash->findChild<QTimer*>();
+    QVERIFY(timer);
+    QVERIFY(timer->isActive());
+    splash->showProgress("Verifying blocks...", 50);
+    QVERIFY(!timer->isActive());
+    splash->showProgress("", 100);
+    QVERIFY(timer->isActive());
+    splash->showStatus("Loading wallet...");
+    QVERIFY(timer->isActive());
+    splash->showProgress("Rescanning...", 0);
+    QVERIFY(timer->isActive());
+    splash->showProgress("Rescanning...", 1);
+    QVERIFY(!timer->isActive());
+    splash->showProgress("Rescanning...", 100);
+    QVERIFY(timer->isActive());
+    splash->showStatus("Starting network threads...");
+    QVERIFY(timer->isActive());
+    splash->hide();
+    QVERIFY(!timer->isActive());
+
+    auto* closeButton = splash->findChild<QToolButton*>();
+    QVERIFY(closeButton);
+    QVERIFY(!closeButton->accessibleName().isEmpty());
+    QCOMPARE(closeButton->focusPolicy(), Qt::StrongFocus);
+}
+
+void WalletUiTests::splashShutdownControls()
+{
+    extern std::atomic<bool> fRequestShutdown;
+    const bool wasShuttingDown = fRequestShutdown.exchange(false);
+    const auto restoreShutdown = qScopeGuard([wasShuttingDown] { fRequestShutdown = wasShuttingDown; });
+    const std::unique_ptr<const NetworkStyle> networkStyle(NetworkStyle::instantiate("regtest"));
+    auto* splash = new SplashScreen(networkStyle.get());
+    const auto cleanup = qScopeGuard([splash] {
+        splash->slotFinish(nullptr);
+        QCoreApplication::sendPostedEvents(splash, QEvent::DeferredDelete);
+    });
+    splash->setAttribute(Qt::WA_DontShowOnScreen);
+    splash->show();
+    splash->activateWindow();
+    QCoreApplication::processEvents();
+    auto* closeButton = splash->findChild<QToolButton*>();
+    auto* timer = splash->findChild<QTimer*>();
+    QVERIFY(closeButton);
+    QVERIFY(timer);
+    QVERIFY(splash->focusWidget());
+
+    QTest::keyClick(splash->focusWidget(), Qt::Key_Space);
+    QVERIFY(!ShutdownRequested());
+    QTest::keyClick(splash, Qt::Key_Tab);
+    QCOMPARE(splash->focusWidget(), closeButton);
+    QTest::keyClick(closeButton, Qt::Key_Space);
+    QVERIFY(ShutdownRequested());
+    QVERIFY(closeButton->isHidden());
+
+    // Late updates must not replace shutdown until core accepts a database rebuild.
+    splash->showStatus("Loading block index...");
+    splash->showProgress("Verifying blocks...", 50);
+    QVERIFY(closeButton->isHidden());
+    QVERIFY(timer->isActive());
+    fRequestShutdown = false;
+    splash->showStatus("Loading block index...");
+    QVERIFY(!closeButton->isHidden());
+    QCOMPARE(splash->focusWidget(), splash);
+    QTest::keyClick(splash->focusWidget(), Qt::Key_Space);
+    QVERIFY(!ShutdownRequested());
+    splash->showProgress("Verifying blocks...", 50);
+    QVERIFY(!timer->isActive());
+
+    // Progress can also be the first update after a canceled shutdown.
+    closeButton->click();
+    QVERIFY(ShutdownRequested());
+    fRequestShutdown = false;
+    splash->showProgress("Verifying blocks...", 50);
+    QVERIFY(!closeButton->isHidden());
+    QVERIFY(!timer->isActive());
+}
+
+void WalletUiTests::peerDetailsTheme()
+{
+    const auto previousTheme = GUIUtil::currentThemeMode();
+    const auto restoreTheme = qScopeGuard([previousTheme] { GUIUtil::setThemeMode(previousTheme); });
+    GUIUtil::setThemeMode(GUIUtil::ThemeMode::Light);
+    GUIUtil::loadTheme();
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    QVERIFY(style);
+    RPCConsole console(style.get(), nullptr);
+    console.setAttribute(Qt::WA_DontShowOnScreen);
+    auto* details = console.findChild<QWidget*>("detailWidget");
+    auto* heading = console.findChild<QWidget*>("peerHeading");
+    auto* label = console.findChild<QLabel*>("peerServices");
+    auto* table = console.findChild<QTableView*>("peerWidget");
+    QVERIFY(details);
+    QVERIFY(heading);
+    QVERIFY(label);
+    QVERIFY(table);
+    QStandardItemModel peers(2, 1);
+    table->setModel(&peers);
+    console.setTabFocus(RPCConsole::TAB_PEERS);
+    details->show();
+    console.show();
+    QCoreApplication::processEvents();
+    const QImage lightRows = table->viewport()->grab().toImage();
+
+    for (const auto mode : {GUIUtil::ThemeMode::Light, GUIUtil::ThemeMode::Dark, GUIUtil::ThemeMode::Light}) {
+        GUIUtil::setThemeMode(mode);
+        QCoreApplication::processEvents();
+        const auto& colors = GUIUtil::themeColors();
+        const QImage window = console.grab().toImage();
+        for (auto* widget : {details, heading}) {
+            const QPoint sample = widget->mapTo(&console, QPoint(2, 2)) * window.devicePixelRatio();
+            QCOMPARE(window.pixelColor(sample), QColor(colors.bg));
+        }
+        QCOMPARE(label->palette().color(QPalette::WindowText), QColor(colors.ink));
+        const QImage rows = table->viewport()->grab().toImage();
+        for (int row = 0; row < peers.rowCount(); ++row) {
+            const QPoint center = table->visualRect(peers.index(row, 0)).center();
+            const QColor expected = mode == GUIUtil::ThemeMode::Dark
+                ? QColor(row == 0 ? colors.panel : colors.panelSoft)
+                : lightRows.pixelColor(center * lightRows.devicePixelRatio());
+            QCOMPARE(rows.pixelColor(center * rows.devicePixelRatio()), expected);
+        }
+    }
+}
+
+void WalletUiTests::transactionCalendarTheme()
+{
+    const auto previousTheme = GUIUtil::currentThemeMode();
+    const auto restoreTheme = qScopeGuard([previousTheme] { GUIUtil::setThemeMode(previousTheme); });
+    GUIUtil::loadTheme();
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    QVERIFY(style);
+    TransactionView transactions(style.get(), nullptr);
+    const auto dates = transactions.findChildren<QDateTimeEdit*>();
+    QCOMPARE(dates.size(), 2);
+    for (const auto mode : {GUIUtil::ThemeMode::Light, GUIUtil::ThemeMode::Dark, GUIUtil::ThemeMode::Light}) {
+        GUIUtil::setThemeMode(mode);
+        for (auto* date : dates) {
+            auto* calendar = date->calendarWidget();
+            calendar->window()->setAttribute(Qt::WA_DontShowOnScreen);
+            calendar->setFirstDayOfWeek(Qt::Monday);
+            calendar->setVerticalHeaderFormat(QCalendarWidget::NoVerticalHeader);
+            calendar->setSelectedDate(QDate(2026, 7, 16));
+            calendar->setCurrentPage(2026, 7);
+            calendar->window()->show();
+            QCoreApplication::processEvents();
+            auto* days = calendar->findChild<QAbstractItemView*>("qt_calendar_calendarview");
+            QVERIFY(days);
+            // Avoid native focus overlays when sampling theme colors.
+            days->clearFocus();
+            const auto& colors = GUIUtil::themeColors();
+            const auto cellHasColor = [days](const QModelIndex& index, const QColor& color) {
+                const QImage cell = days->viewport()->grab(days->visualRect(index)).toImage();
+                for (int y = 0; y < cell.height(); ++y) {
+                    for (int x = 0; x < cell.width(); ++x) {
+                        if (cell.pixelColor(x, y) == color) return true;
+                    }
+                }
+                return false;
+            };
+            const QModelIndex selected = days->selectionModel()->currentIndex();
+            QCOMPARE(selected.data().toInt(), 16);
+            const QModelIndex weekday = selected.siblingAtColumn(selected.column() + 1);
+            const QModelIndex weekend = selected.siblingAtColumn(selected.column() + 2);
+            // With a Monday-first July 2026 calendar, the first Tuesday is June 30.
+            const QModelIndex otherMonth = days->model()->index(1, 1);
+            QCOMPARE(otherMonth.data().toInt(), 30);
+            QVERIFY(cellHasColor(selected, QColor(colors.wineDeep)));
+            QVERIFY(cellHasColor(selected, QColor(Qt::white)));
+            QVERIFY(cellHasColor(weekday, QColor(colors.panel)));
+            QVERIFY(cellHasColor(weekday, QColor(colors.ink)));
+            QVERIFY(cellHasColor(weekend, QColor(colors.inkSoft)));
+            QVERIFY(cellHasColor(otherMonth, QColor(colors.inkFaint)));
+            days->setEnabled(false);
+            QCoreApplication::processEvents();
+            QVERIFY(cellHasColor(weekday, QColor(colors.inkFaint)));
+            days->setEnabled(true);
+            calendar->window()->hide();
         }
     }
 }
@@ -391,11 +680,16 @@ void WalletUiTests::initialSyncQueryDoesNotBlock()
     QElapsedTimer timer;
     timer.start();
     const bool initialSync = model.inInitialBlockDownload();
+    model.cachedVerificationProgress = 0.625;
+    const auto progress = model.getVerificationProgress(nullptr);
+    const auto date = model.getLastBlockDate();
     const auto elapsed = timer.elapsed();
     release.set_value();
     validation.join();
     QVERIFY(initialSync);
     QVERIFY(elapsed < 1000);
+    QCOMPARE(progress, 0.625);
+    QVERIFY(date.isValid());
 
     CBlockIndex header;
     header.nHeight = 100;
@@ -407,6 +701,15 @@ void WalletUiTests::initialSyncQueryDoesNotBlock()
     uiInterface.NotifyBlockTip(true, &header);
     QVERIFY(!model.inInitialBlockDownload());
     QCOMPARE(model.cachedNumBlocks.load(), 100);
+    QSignalSpy tips(&model, &ClientModel::numBlocksChanged);
+    header.nHeight = 101;
+    uiInterface.NotifyBlockTip(true, &header);
+    model.updateTimer();
+    QCOMPARE(tips.count(), 2);
+    QCOMPARE(tips.last().at(0).toInt(), 101);
+    QCOMPARE(tips.last().at(3).toBool(), false);
+    model.updateTimer();
+    QCOMPARE(tips.count(), 2);
 }
 
 void WalletUiTests::synchronizationProgress()
@@ -414,127 +717,296 @@ void WalletUiTests::synchronizationProgress()
     const auto oldDisableWallet = GetArg("-disablewallet", "0");
     const auto oldNetwork = Params().NetworkIDString();
     const auto oldMasternodeSync = masternodeSync;
-    CBlockIndex* oldTip = chainActive.Tip();
+    auto oldConnections = std::move(g_connman);
     const bool oldReindex = fReindex;
     const auto restoreNode = qScopeGuard([&] {
         ForceSetArg("-disablewallet", oldDisableWallet);
         SelectParams(oldNetwork);
         masternodeSync = oldMasternodeSync;
         fReindex = oldReindex;
-        LOCK(cs_main);
-        chainActive.SetTip(oldTip);
+        g_connman = std::move(oldConnections);
     });
     SelectParams(CBaseChainParams::TESTNET);
     fReindex = false;
-    CBlockIndex tip;
-    tip.nHeight = 0;
-    const auto now = QDateTime::currentDateTime();
-    tip.nTime = now.addDays(-1).toSecsSinceEpoch();
-    {
-        LOCK(cs_main);
-        chainActive.SetTip(&tip);
-    }
-
-    CConnman connections(0, 0);
+    g_connman = std::make_unique<CConnman>(0, 0);
     masternodeSync.Reset();
-    masternodeSync.SwitchToNextAsset(connections);
-    masternodeSync.SwitchToNextAsset(connections);
+    masternodeSync.SwitchToNextAsset(*g_connman);
+    masternodeSync.SwitchToNextAsset(*g_connman);
     QVERIFY(masternodeSync.IsSynced());
-
     const std::unique_ptr<const PlatformStyle> platformStyle(PlatformStyle::instantiate("other"));
     const std::unique_ptr<const NetworkStyle> networkStyle(NetworkStyle::instantiate("test"));
     QVERIFY(platformStyle);
     QVERIFY(networkStyle);
     ClientModel model(nullptr);
-    model.cachedInitialBlockDownload = false;
+    const auto now = QDateTime::currentDateTime();
+    model.cachedNumBlocks = 10;
+    model.cachedLastBlockDate = now.addDays(-1);
+    model.cachedInitialBlockDownload = true;
+    model.cachedVerificationProgress = 0.6251;
+
+    // Validation may be busy throughout these updates. All GUI reads use real cached values.
+    std::promise<void> locked, release;
+    auto ready = locked.get_future();
+    auto done = release.get_future();
+    std::thread validation([&] {
+        LOCK(cs_main);
+        locked.set_value();
+        done.wait_for(std::chrono::seconds(30));
+    });
+    const auto releaseValidation = qScopeGuard([&] {
+        release.set_value();
+        validation.join();
+    });
+    ready.wait();
     ForceSetArg("-disablewallet", "0");
-    {
-        BitcoinGUI gui(platformStyle.get(), networkStyle.get());
-        gui.clientModel = &model;
-        gui.modalOverlay->setKnownBestHeight(100, now);
-        // Headers are current and IBD has ended, but the validated tip is a day old.
-        gui.updateNavigationSyncCard(QString(), 0.6251);
-        QVERIFY(!gui.navigationSyncCard->isHidden());
-        QCOMPARE(gui.navigationSyncPercent->text(), QStringLiteral("62.51%"));
-        gui.setAdditionalDataSyncProgress(1.0);
-        QCOMPARE(gui.navigationSyncPercent->text(), QStringLiteral("62.51%"));
-        gui.setNumBlocks(0, now.addDays(-1), 0.6251, false);
-        QVERIFY(!gui.navigationSyncCard->isHidden());
-        QVERIFY(gui.navigationSyncFraction < 1.0);
-        gui.modalOverlay->setKnownBestHeight(101, now.addDays(-10));
-        gui.updateHeadersSyncProgressLabel();
-        const double firstProgress = gui.navigationSyncFraction;
-        gui.modalOverlay->setKnownBestHeight(102, now.addDays(-5));
-        gui.updateHeadersSyncProgressLabel();
-        QVERIFY(gui.navigationSyncFraction > firstProgress);
-        QVERIFY(gui.navigationSyncFraction < 1.0);
+    BitcoinGUI gui(platformStyle.get(), networkStyle.get());
+    gui.clientModel = &model;
+    gui.setNumConnections(1);
+    gui.setNumBlocks(10, now.addDays(-1), 0.6251, false);
+    gui.setNumBlocks(100, now.addDays(-10), 0.99, true);
+    QVERIFY(gui.progressBarLabel->text().startsWith("Syncing Headers"));
+    QCOMPARE(gui.navigationSyncPercent->text(), QStringLiteral("62.51%"));
+    const int stalledFrame = gui.spinnerFrame;
+    gui.updateSyncStatus();
+    QCOMPARE(gui.spinnerFrame, stalledFrame);
+    gui.setNumBlocks(11, now.addDays(-1), 0.65, false);
+    QVERIFY(gui.spinnerFrame != stalledFrame);
+    QVERIFY(gui.progressBarLabel->text().startsWith("Syncing Headers"));
+    QCOMPARE(gui.navigationSyncPercent->text(), QStringLiteral("65.00%"));
 
-        fReindex = true;
-        gui.setNumBlocks(0, now.addDays(-1), 0.25, false);
-        const QString reindexStatus = gui.progressBarLabel->text();
-        gui.updateHeadersSyncProgressLabel();
-        QCOMPARE(gui.navigationSyncFraction, 0.25);
-        QCOMPARE(gui.progressBarLabel->text(), reindexStatus);
-        fReindex = false;
+    // Header completion must update the phase even without another block.
+    gui.setNumBlocks(101, now, 0.99, true);
+    QCOMPARE(gui.progressBarLabel->text(), QStringLiteral("Synchronizing with network..."));
+    QCOMPARE(gui.navigationSyncFraction, 0.65);
+    gui.setNumConnections(0);
+    QCOMPARE(gui.progressBarLabel->text(), QStringLiteral("Connecting to peers..."));
+    QCOMPARE(gui.navigationSyncFraction, 0.65);
+    gui.setNumConnections(1);
+    QCOMPARE(gui.progressBarLabel->text(), QStringLiteral("Synchronizing with network..."));
+    QCOMPARE(gui.navigationSyncFraction, 0.65);
 
-        tip.nTime = now.toSecsSinceEpoch();
-        ClientModel alreadySynced(nullptr);
-        QVERIFY(!alreadySynced.inInitialBlockDownload());
-        gui.modalOverlay->setKnownBestHeight(103, now);
-        gui.updateNavigationSyncCard(QString(), 1.0);
-        QVERIFY(gui.navigationSyncCard->isHidden());
-        tip.nTime = now.addDays(-1).toSecsSinceEpoch();
-        auto* refreshTimer = gui.findChild<QTimer*>("syncStateTimer");
-        QVERIFY(refreshTimer);
-        QVERIFY(QMetaObject::invokeMethod(refreshTimer, "timeout"));
-        QVERIFY(!gui.navigationSyncCard->isHidden());
-        QVERIFY(gui.navigationSyncFraction < 1.0);
-        const QString catchUpStatus = gui.progressBarLabel->text();
-        QVERIFY(QMetaObject::invokeMethod(refreshTimer, "timeout"));
-        QCOMPARE(gui.progressBarLabel->text(), catchUpStatus);
+    // A lull in a caught-up chain is not evidence of an active header download.
+    model.cachedInitialBlockDownload = false;
+    model.cachedNumBlocks = 101;
+    model.cachedBestHeaderHeight = 101;
+    model.cachedLastBlockDate = now.addSecs(-2LL * 60 * 60);
+    gui.setNumBlocks(101, model.cachedLastBlockDate, 0.99, false);
+    gui.setNumBlocks(101, model.cachedLastBlockDate, 0.99, true);
+    QCOMPARE(gui.progressBarLabel->text(), QStringLiteral("Catching up..."));
+    QVERIFY(!gui.modalOverlay->isHeaderSyncPending());
+    QVERIFY(!gui.modalOverlay->isLayerVisible());
 
-        SelectParams(CBaseChainParams::REGTEST);
-        QVERIFY(!gui.isActivelySyncing());
-        fReindex = true;
-        QVERIFY(gui.isActivelySyncing());
-        fReindex = false;
-        SelectParams(CBaseChainParams::TESTNET);
-    }
+    // A fresh block tip does not finish pending headers after the IBD latch clears.
+    model.cachedLastBlockDate = now;
+    gui.setNumBlocks(101, now, 0.99, false);
+    QVERIFY(!model.inInitialBlockDownload());
+    QVERIFY(!gui.blockchainSyncInProgress());
+    gui.setNumBlocks(102, now.addDays(-5), 0.99, true);
+    QVERIFY(gui.modalOverlay->isHeaderSyncPending());
+    QVERIFY(gui.blockchainSyncInProgress());
+    QVERIFY(!gui.navigationSyncCard->isHidden());
+    QVERIFY(gui.progressBarLabel->text().startsWith("Syncing Headers"));
+    gui.setNumBlocks(102, now, 0.99, true);
+
+    model.cachedLastBlockDate = now;
+    masternodeSync.Reset();
+    masternodeSync.SwitchToNextAsset(*g_connman);
+    gui.setNumBlocks(101, now, 1.0, false);
+    gui.setAdditionalDataSyncProgress(-0.25);
+    QCOMPARE(gui.progressBarLabel->text(), QStringLiteral("Finishing sync..."));
+    QCOMPARE(gui.navigationSyncFraction, 1.0);
+    gui.showModalOverlay();
+    QVERIFY(gui.modalOverlay->isLayerVisible());
+    auto* refreshTimer = gui.findChild<QTimer*>("syncStateTimer");
+    QVERIFY(refreshTimer);
+    QVERIFY(QMetaObject::invokeMethod(refreshTimer, "timeout"));
+    QVERIFY(gui.modalOverlay->isLayerVisible());
+    const int waitingFrame = gui.spinnerFrame;
+    QVERIFY(QMetaObject::invokeMethod(refreshTimer, "timeout"));
+    QCOMPARE(gui.spinnerFrame, waitingFrame);
+
+    // Observe queued balloons without invoking the platform notification service.
+    struct NotificationCalls : QObject {
+        int count{0};
+        bool eventFilter(QObject*, QEvent* event) override
+        {
+            if (event->type() != QEvent::MetaCall) {
+                return false;
+            }
+            ++count;
+            return true;
+        }
+    } notifications;
+    gui.installEventFilter(&notifications);
+    QCoreApplication::sendPostedEvents(&gui, QEvent::MetaCall);
+    notifications.count = 0;
+    gui.incomingTransaction("today", 0, COIN, "Received", "", "");
+    QCoreApplication::sendPostedEvents(&gui, QEvent::MetaCall);
+    QCOMPARE(notifications.count, 0);
+
+    masternodeSync.SwitchToNextAsset(*g_connman);
+    gui.setAdditionalDataSyncProgress(1.0);
+    gui.incomingTransaction("today", 0, COIN, "Received", "", "");
+    QCoreApplication::sendPostedEvents(&gui, QEvent::MetaCall);
+    QCOMPARE(notifications.count, 1);
+    QVERIFY(gui.navigationSyncCard->isHidden());
+    QVERIFY(gui.labelBlocksIcon->toolTip().contains("Up to date"));
+    const auto syncedIcon = gui.labelBlocksIcon->pixmap().toImage();
+    gui.updateProgressBarLabel("Batch verifying Spark Proofs...");
+    QCOMPARE(gui.navigationSyncLabel->toolTip(), QStringLiteral("Synced"));
+    QVERIFY(gui.progressBarLabel->isHidden());
+    QVERIFY(gui.navigationSyncCard->isHidden());
+    QVERIFY(gui.navigationSyncProgress->property("synced").toBool());
+    QVERIFY(gui.modalOverlay->findChild<QProgressBar*>("progressBar")->property("synced").toBool());
+    QCOMPARE(gui.labelBlocksIcon->pixmap().toImage(), syncedIcon);
+    gui.updateProgressBarLabel(QString());
+    QVERIFY(gui.navigationSyncCard->isHidden());
+
+    gui.setNumConnections(0);
+    QCOMPARE(gui.progressBarLabel->text(), QStringLiteral("Connecting to peers..."));
+    QVERIFY(!gui.navigationSyncProgress->property("synced").toBool());
+    QVERIFY(!gui.modalOverlay->findChild<QProgressBar*>("progressBar")->property("synced").toBool());
+    QVERIFY(gui.labelBlocksIcon->pixmap().toImage() != syncedIcon);
+    QVERIFY(gui.labelBlocksIcon->toolTip().contains("Connecting to peers..."));
+    QVERIFY(!gui.labelBlocksIcon->toolTip().contains("Up to date"));
+    gui.setNumConnections(1);
+    g_connman->SetNetworkActive(false);
+    gui.setNetworkActive(false);
+    QCOMPARE(gui.progressBarLabel->text(), QStringLiteral("Network activity disabled"));
+    QVERIFY(!gui.modalOverlay->findChild<QProgressBar*>("progressBar")->property("synced").toBool());
+    QVERIFY(gui.labelBlocksIcon->pixmap().toImage() != syncedIcon);
+    QVERIFY(gui.labelBlocksIcon->toolTip().contains("Network activity disabled"));
+    QVERIFY(!gui.labelBlocksIcon->toolTip().contains("Up to date"));
+    g_connman->SetNetworkActive(true);
+    gui.setNetworkActive(true);
+
+    gui.modalOverlay->showHide(true);
+    model.cachedLastBlockDate = now.addDays(-1);
+    model.cachedBestHeaderHeight = 102;
+    model.cachedBestHeaderTime = now.toSecsSinceEpoch();
+    model.cachedVerificationProgress = 0.987;
+    QVERIFY(QMetaObject::invokeMethod(refreshTimer, "timeout"));
+    QCOMPARE(gui.progressBarLabel->text(), QStringLiteral("Catching up..."));
+    QCOMPARE(gui.navigationSyncFraction, 0.987);
+    QCOMPARE(gui.modalOverlay->findChild<QLabel*>("percentageProgress")->text(), QStringLiteral("98.70%"));
+    QVERIFY(gui.modalOverlay->isLayerVisible());
+    gui.incomingTransaction("today", 0, COIN, "Received", "", "");
+    QCoreApplication::sendPostedEvents(&gui, QEvent::MetaCall);
+    QCOMPARE(notifications.count, 1);
+    model.cachedLastBlockDate = now;
+    gui.setNumBlocks(102, now, 1.0, false);
+    QCOMPARE(gui.labelBlocksIcon->pixmap().toImage(), syncedIcon);
+    QVERIFY(gui.labelBlocksIcon->toolTip().contains("Up to date"));
+
+    fReindex = true;
+    gui.setNumBlocks(102, now, 0.25, false);
+    gui.setNumBlocks(103, now.addDays(-5), 0.99, true);
+    QCOMPARE(gui.progressBarLabel->text(), QStringLiteral("Reindexing blocks on disk..."));
+    QCOMPARE(gui.navigationSyncFraction, 0.25);
+    fReindex = false;
+    SelectParams(CBaseChainParams::REGTEST);
+    model.cachedLastBlockDate = now.addDays(-1);
+    gui.setNumBlocks(102, model.cachedLastBlockDate, 1.0, false);
+    QVERIFY(gui.modalOverlay->isHeaderSyncPending());
+    QVERIFY(!gui.blockchainSyncInProgress());
+    QVERIFY(!gui.modalOverlay->isLayerVisible());
+    QCOMPARE(gui.progressBarLabel->text(), QStringLiteral("Synced"));
+    QVERIFY(!gui.isActivelySyncing());
+    fReindex = true;
+    QVERIFY(gui.isActivelySyncing());
+    fReindex = false;
+    SelectParams(CBaseChainParams::TESTNET);
+    model.cachedLastBlockDate = now;
 
     ForceSetArg("-disablewallet", "1");
     BitcoinGUI node(platformStyle.get(), networkStyle.get());
     node.clientModel = &model;
-    QVERIFY(!node.navigationSyncCard);
-    node.modalOverlay->setKnownBestHeight(100, now.addDays(-10));
-    node.updateHeadersSyncProgressLabel();
-    QVERIFY(!node.progressBar->isHidden());
-    const int headerProgress = node.progressBar->value();
-    node.modalOverlay->setKnownBestHeight(101, now.addDays(-5));
-    node.updateHeadersSyncProgressLabel();
-    QVERIFY(node.progressBar->value() > headerProgress);
-    fReindex = true;
-    node.setNumBlocks(0, now.addDays(-1), 0.25, false);
+    node.setNumConnections(1);
+    model.cachedInitialBlockDownload = true;
+    node.setNumBlocks(10, now.addDays(-1), 0.25, false);
+    node.setNumBlocks(100, now.addDays(-10), 0.99, true);
     QVERIFY(!node.progressBarLabel->isHidden());
     QVERIFY(!node.progressBar->isHidden());
     QCOMPARE(node.progressBar->value(), 250000000);
-    fReindex = false;
-    node.modalOverlay->setKnownBestHeight(102, now);
-    tip.nTime = now.toSecsSinceEpoch();
-    node.setNumBlocks(0, now, 1.0, false);
+    node.setNumBlocks(101, now, 0.99, true);
+    QCOMPARE(node.progressBarLabel->text(), QStringLiteral("Synchronizing with network..."));
+    model.cachedInitialBlockDownload = false;
+    node.setNumBlocks(101, now, 1.0, false);
     QVERIFY(node.progressBarLabel->isHidden());
     QVERIFY(node.progressBar->isHidden());
+}
 
-    // Retry a header cache that was unavailable when a node-only GUI attached.
-    node.modalOverlay->setKnownBestHeight(103, now.addDays(-5));
-    node.updateHeadersSyncProgressLabel();
-    QVERIFY(!node.progressBar->isHidden());
-    model.cachedBestHeaderHeight = 104;
-    model.cachedBestHeaderTime = now.toSecsSinceEpoch();
-    auto* refreshTimer = node.findChild<QTimer*>("syncStateTimer");
-    QVERIFY(refreshTimer);
-    QVERIFY(QMetaObject::invokeMethod(refreshTimer, "timeout"));
-    QVERIFY(node.progressBarLabel->isHidden());
-    QVERIFY(node.progressBar->isHidden());
+void WalletUiTests::synchronizationEstimates()
+{
+    QWidget parent;
+    ModalOverlay overlay(&parent);
+    const auto now = QDateTime::currentDateTime();
+    auto* rate = overlay.findChild<QLabel*>("progressIncreasePerH");
+    auto* remaining = overlay.findChild<QLabel*>("expectedTimeLeft");
+    auto* blocks = overlay.findChild<QLabel*>("numberOfBlocksLeft");
+    auto* percentage = overlay.findChild<QLabel*>("percentageProgress");
+    QVERIFY(rate);
+    QVERIFY(remaining);
+    QVERIFY(blocks);
+    QVERIFY(percentage);
+    QVERIFY(!overlay.isHeaderSyncPending());
+    overlay.tipUpdate(10, QDateTime(), 0.0);
+    QVERIFY(overlay.blockProcessTime.isEmpty());
+    overlay.tipUpdate(10, now.addDays(-1), 0.5);
+    overlay.setKnownBestHeight(100, now.addDays(-10));
+    QVERIFY(blocks->text().contains("Syncing Headers"));
+    overlay.setKnownBestHeight(101, now);
+    QCOMPARE(blocks->text(), QStringLiteral("91"));
+
+    const qint64 timestamp = QDateTime::currentMSecsSinceEpoch();
+    for (const auto& sample : {qMakePair(timestamp, 0.4),
+                              qMakePair(timestamp - 1000, 0.5),
+                              qMakePair(timestamp - 1000, 0.6)}) {
+        overlay.blockProcessTime = {{timestamp, 0.5}, sample};
+        overlay.updateProgressDisplay();
+        QCOMPARE(rate->text(), QStringLiteral("0.00%"));
+        QCOMPARE(remaining->text(), QStringLiteral("Unknown..."));
+    }
+    overlay.blockProcessTime = {{timestamp, 0.5}, {timestamp - 1000, 0.4}};
+    overlay.updateProgressDisplay();
+    QVERIFY(rate->text() != QStringLiteral("0.00%"));
+    QVERIFY(remaining->text() != QStringLiteral("Unknown..."));
+    overlay.setSyncComplete(true);
+    QCOMPARE(percentage->text(), QStringLiteral("100.00%"));
+    overlay.setSyncComplete(false);
+    QCOMPARE(percentage->text(), QStringLiteral("50.00%"));
+    QCOMPARE(remaining->text(), QStringLiteral("Unknown..."));
+    overlay.tipUpdate(101, now.addSecs(-5LL * 60 * 60), 0.99);
+    overlay.setKnownBestHeight(101, now.addSecs(-5LL * 60 * 60));
+    QVERIFY(!overlay.isHeaderSyncPending());
+    QCOMPARE(blocks->text(), QStringLiteral("Unknown..."));
+    overlay.setKnownBestHeight(101, now);
+    QCOMPARE(blocks->text(), QStringLiteral("0"));
+    overlay.closeClicked();
+    overlay.showHide();
+    QVERIFY(!overlay.isLayerVisible());
+    overlay.showHide(false, true);
+    QVERIFY(overlay.isLayerVisible());
+}
+
+void WalletUiTests::synchronizationWarnings()
+{
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    QVERIFY(style);
+    WalletView view(style.get(), nullptr);
+    auto* sendWarning = view.findChild<QPushButton*>("balanceSyncWarning");
+    auto* masternodeWarning = view.findChild<QLabel*>("masternodeSyncWarning");
+    QVERIFY(sendWarning);
+    QVERIFY(masternodeWarning);
+    view.showOutOfSyncWarning(false);
+    QVERIFY(sendWarning->isHidden());
+    QVERIFY(masternodeWarning->isHidden());
+    view.showOutOfSyncWarning(true);
+    QVERIFY(!sendWarning->isHidden());
+    QVERIFY(!masternodeWarning->isHidden());
+    QSignalSpy details(&view, &WalletView::outOfSyncWarningClicked);
+    sendWarning->click();
+    QCOMPARE(details.count(), 1);
 }
 
 void WalletUiTests::collapsedNavigationRemainsUsable()
@@ -579,6 +1051,90 @@ void WalletUiTests::collapsedNavigationRemainsUsable()
         QCOMPARE(gui.toolbar->width(), expandedWidth);
         QVERIFY(gui.historyAction->isChecked());
     }
+}
+
+/**
+ * Keep styled controls and painted text on the same brand fonts after theme changes and resizing.
+ * @pre The Qt test application is initialized on the GUI thread.
+ */
+void WalletUiTests::brandTypography()
+{
+    GUIUtil::loadTheme();
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    SendCoinsDialog send(style.get());
+    ReceiveCoinsDialog receive(style.get());
+    const auto previousTheme = GUIUtil::currentThemeMode();
+    const auto restoreTheme = qScopeGuard([previousTheme] { GUIUtil::setThemeMode(previousTheme); });
+    for (const auto mode : {GUIUtil::ThemeMode::Light, GUIUtil::ThemeMode::Dark}) {
+        GUIUtil::setThemeMode(mode);
+        for (const QSize size : {QSize(944, 625), QSize(2100, 1400)}) {
+            for (QWidget* page : {static_cast<QWidget*>(&send), static_cast<QWidget*>(&receive)}) {
+                page->setAttribute(Qt::WA_DontShowOnScreen);
+                page->show();
+                page->resize(size);
+            }
+            QCoreApplication::processEvents();
+            for (const char* name : {"labelFeeHeadline", "labelFeeMinimized", "payTo", "labelBalance",
+                                    "labelCoinControlFee", "labelCoinControlFeeText"}) {
+                auto* widget = send.findChild<QWidget*>(name);
+                QVERIFY(widget);
+                QCOMPARE(widget->font().family(), QStringLiteral("Source Sans Pro"));
+                QCOMPARE(widget->font().pixelSize(), 16);
+            }
+            auto* requests = receive.findChild<QTableView*>();
+            QVERIFY(requests);
+            QCOMPARE(requests->font().pixelSize(), 16);
+        }
+        for (const auto role : {GUIUtil::TextStyle::Body, GUIUtil::TextStyle::Heading1,
+                                GUIUtil::TextStyle::Heading2, GUIUtil::TextStyle::Heading3}) {
+            QLabel label(QStringLiteral("Typography 0123456789"));
+            const auto expected = GUIUtil::brandFont(role);
+            const QString token = role == GUIUtil::TextStyle::Body ? QStringLiteral("$FONT_BODY")
+                : QStringLiteral("$FONT_H%1").arg(static_cast<int>(role));
+            label.setStyleSheet(GUIUtil::themed(QStringLiteral("font: %1;").arg(token)));
+            label.ensurePolished();
+            QCOMPARE(label.font().pixelSize(), expected.pixelSize());
+            // The minimal QPA plugin used by CI has no font database.
+            QCOMPARE(label.font().family(), expected.family());
+            QCOMPARE(label.font().weight(), expected.weight());
+        }
+    }
+}
+
+/** Verify all eight recent transactions fit when the list is at its minimum height. */
+void WalletUiTests::recentActivityFitsBrandFont()
+{
+    GUIUtil::loadTheme();
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    QStandardItemModel history(8, 1);
+    OverviewPage overview(style.get());
+    auto* list = overview.findChild<QListView*>(QStringLiteral("listTransactions"));
+    QVERIFY(list);
+    list->setModel(&history);
+    list->setFixedHeight(list->minimumHeight());
+    list->show();
+    overview.setAttribute(Qt::WA_DontShowOnScreen);
+    overview.show();
+    overview.resize(944, 625);
+    QTRY_VERIFY(list->viewport()->rect().contains(list->visualRect(history.index(7, 0))));
+
+    const auto index = history.index(0, 0);
+    history.setData(index, TransactionRecord::RecvSpark, TransactionTableModel::TypeRole);
+    history.setData(index, QIcon(":/icons/transaction_confirmed"), TransactionTableModel::InstantSendDecorationRole);
+    QStyleOptionViewItem option;
+    option.initFrom(list);
+    option.rect = QRect(0, 0, 220, list->itemDelegate()->sizeHint(option, index).height());
+    const auto renderIcons = [&](qint64 amount) {
+        history.setData(index, amount, TransactionTableModel::AmountRole);
+        QImage image(option.rect.size(), QImage::Format_ARGB32_Premultiplied);
+        image.fill(Qt::transparent);
+        QPainter painter(&image);
+        list->itemDelegate()->paint(&painter, option, index);
+        painter.end();
+        // Changing the amount must not paint over the transaction or lock icons.
+        return image.copy(0, 0, 77, image.height());
+    };
+    QCOMPARE(renderIcons(0), renderIcons(21000000 * COIN));
 }
 
 /**
@@ -678,7 +1234,7 @@ void WalletUiTests::sendFormFitsSmallScreen()
     auto* scroll = dialog.findChild<QScrollArea*>("scrollArea");
     QVERIFY(scroll);
 
-    // A single recipient, selected inputs, privacy warning and memo should fit without scrolling.
+    // Keep a single recipient, selected inputs, privacy warning and memo reachable at the body font size.
     auto* automatic = dialog.findChild<QLabel*>("labelCoinControlAutomaticallySelected");
     auto* warning = dialog.findChild<QLabel*>("textWarning");
     QVERIFY(automatic);
@@ -710,11 +1266,13 @@ void WalletUiTests::sendFormFitsSmallScreen()
             QTRY_VERIFY2(value->height() >= value->minimumSizeHint().height() &&
                          value->width() >= value->minimumSizeHint().width(), name);
         }
-        QTRY_VERIFY(scroll->verticalScrollBar()->maximum() == 0 && scroll->horizontalScrollBar()->maximum() == 0);
+        QTRY_COMPARE(scroll->horizontalScrollBar()->maximum(), 0);
         for (const char* name : {"payAmount", "checkboxSubtractFeeFromAmount", "messageTextLabel", "buttonChooseFee"}) {
             auto* field = dialog.findChild<QWidget*>(name);
             QVERIFY(field);
             QVERIFY(field->isVisible());
+            scroll->ensureWidgetVisible(field);
+            QCoreApplication::processEvents();
             QVERIFY(scroll->viewport()->rect().contains(QRect(field->mapTo(scroll->viewport(), QPoint()), field->size())));
         }
         auto* amount = dialog.findChild<QWidget*>("payAmount");
@@ -796,4 +1354,61 @@ void WalletUiTests::receiveMnemonics()
         QVERIFY(label->buddy());
         QVERIFY(label->text().contains(QLatin1Char('&')));
     }
+}
+
+void WalletUiTests::emptyRecoverySeed()
+{
+#ifdef ENABLE_WALLET
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const std::string oldWallet = GetArg("-wallet", DEFAULT_WALLET_DAT);
+    const auto restoreWallet = qScopeGuard([&] { ForceSetArg("-wallet", oldWallet); });
+    ForceSetArg("-wallet", directory.filePath(QStringLiteral("wallet.dat")).toStdString());
+
+    for (const QString& seed : {QString(), QStringLiteral(" \t\r\n "),
+                               QString(QChar(0x00a0)), QString(QChar(0x3000))}) {
+        for (const bool use12 : {false, true}) {
+            QString error;
+            bool submitted = false;
+            bool timedOut = false;
+            QTimer timer;
+            QTimer::singleShot(5000, &timer, [&] {
+                timedOut = true;
+                if (auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget()))
+                    dialog->reject();
+            });
+            connect(&timer, &QTimer::timeout, [&] {
+                auto* dialog = qobject_cast<Recover*>(QApplication::activeModalWidget());
+                if (!dialog)
+                    return;
+                auto* words = dialog->findChild<QLineEdit*>("mnemonicWords");
+                auto* recoverExisting = dialog->findChild<QRadioButton*>("recoverExisting");
+                auto* wordCount = dialog->findChild<QRadioButton*>(use12 ? "use12" : "use24");
+                auto* message = dialog->findChild<QLabel*>("errorMessage");
+                if (!words || !recoverExisting || !wordCount || !message) {
+                    dialog->reject();
+                    return;
+                }
+                if (!submitted) {
+                    recoverExisting->click();
+                    wordCount->click();
+                    words->setText(seed);
+                    submitted = true;
+                    dialog->accept();
+                } else {
+                    error = message->text();
+                    dialog->reject();
+                }
+            });
+            timer.start(0);
+            bool newWallet = false;
+            const bool accepted = Recover::askRecover(newWallet);
+            timer.stop();
+            QVERIFY(!timedOut);
+            QVERIFY(!accepted);
+            QVERIFY(submitted);
+            QCOMPARE(error, Recover::tr("Recovery seed phrase can't be empty."));
+        }
+    }
+#endif
 }
